@@ -1,0 +1,46 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+agent1env/
+agent2env/
+agentenv/
+*.egg-info/
+dist/
+build/
+
+# ===== Virtual Environments (your case) =====
+agent1env/
+agent2env/
+agentenv/
+agent_1env/
+agent_2env/
+
+# ===== Environment variables =====
+.env
+backend/.env
+
+# ===== Node / Frontend =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== Build outputs =====
+frontend/dist/
+frontend/build/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== Logs =====
+*.log
