@@ -1,16 +1,20 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/chat': {
-        target: 'http://localhost:8501',
+      '/upload': {
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         secure: false,
-      }
-    }
-  }
+      },
+      '/chat': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
+  },
 })
