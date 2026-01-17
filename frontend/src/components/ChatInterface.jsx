@@ -32,11 +32,87 @@ const ChatInterface = () => {
     ]);
   };
 
+  // New: bot message that can include a table preview
+  const addBotPreviewMessage = ({ filename, dataset_id, headRows }) => {
+    setMessages(prev => [
+      ...prev,
+      {
+        id: Date.now() + Math.random(),
+        sender: 'bot',
+        isError: false,
+        kind: 'upload_preview',
+        filename,
+        dataset_id,
+        headRows: Array.isArray(headRows) ? headRows : [],
+      }
+    ]);
+  };
+
   const addUserMessage = (text) => {
     setMessages(prev => [
       ...prev,
       { id: Date.now() + Math.random(), text, sender: 'user' }
     ]);
+  };
+
+  // Helper: render a JSON rows array as a table
+  const PreviewTable = ({ rows }) => {
+    if (!rows || rows.length === 0) {
+      return <div style={{ marginTop: '0.5rem' }}>No preview rows available.</div>;
+    }
+
+    // Build a stable column list across all rows
+    const colSet = new Set();
+    rows.forEach(r => Object.keys(r || {}).forEach(k => colSet.add(k)));
+    const columns = Array.from(colSet);
+
+    return (
+      <div style={{ marginTop: '0.75rem', overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              {columns.map((c) => (
+                <th
+                  key={c}
+                  style={{
+                    textAlign: 'left',
+                    padding: '0.5rem',
+                    borderBottom: '1px solid rgba(255,255,255,0.15)',
+                    color: 'rgba(255,255,255,0.9)',
+                    fontWeight: 600,
+                    fontSize: '0.9rem',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, idx) => (
+              <tr key={idx}>
+                {columns.map((c) => (
+                  <td
+                    key={c}
+                    style={{
+                      textAlign: 'left',
+                      padding: '0.5rem',
+                      borderBottom: '1px solid rgba(255,255,255,0.08)',
+                      color: 'rgba(255,255,255,0.85)',
+                      fontSize: '0.9rem',
+                      verticalAlign: 'top'
+                    }}
+                  >
+                    {r?.[c] === null || r?.[c] === undefined ? '' : String(r[c])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
   };
 
   const handleFileUpload = async (e) => {
@@ -69,10 +145,15 @@ const ChatInterface = () => {
       setDatasetId(data.dataset_id);
       setFileName(data.filename || file.name);
 
+      // ✅ Use table-based preview message instead of JSON stringify
+      addBotPreviewMessage({
+        filename: data.filename || file.name,
+        dataset_id: data.dataset_id,
+        headRows: data.preview?.head || [],
+      });
+
+      // Add a normal instruction message after the table preview
       addBotMessage(
-        `File uploaded successfully: ${data.filename || file.name}\n\n` +
-        `Dataset ID: ${data.dataset_id}\n\n` +
-        `Top 5 rows:\n${JSON.stringify(data.preview?.head || [], null, 2)}\n\n` +
         `Now type a message like "hi" to get the plan and proposed ds/y, then reply "confirm".`
       );
 
@@ -125,11 +206,24 @@ const ChatInterface = () => {
         throw new Error(data.error || 'Chat failed');
       }
 
-      const botMessageText =
+      // Prefer assistant_message, but ALWAYS append results when present
+      let botMessageText =
         data.assistant_message ||
         data.reply ||
         data.message ||
-        JSON.stringify(data, null, 2);
+        "";
+
+      if (data.results) {
+        botMessageText += `\n\nResults:\n${JSON.stringify(data.results, null, 2)}`;
+      }
+
+      if (data.error) {
+        botMessageText += `\n\nError:\n${data.error}`;
+      }
+
+      if (!botMessageText.trim()) {
+        botMessageText = JSON.stringify(data, null, 2);
+      }
 
       addBotMessage(botMessageText, Boolean(data.error));
 
@@ -148,7 +242,6 @@ const ChatInterface = () => {
       <div className="chat-header">
         <h2>AI Assistant</h2>
 
-        {/* Minimal upload UI inside header (no CSS changes required) */}
         <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.75rem', justifyContent: 'center', flexWrap: 'wrap' }}>
           <input
             type="file"
@@ -168,15 +261,42 @@ const ChatInterface = () => {
       </div>
 
       <div className="messages-area">
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`message ${msg.sender} ${msg.isError ? 'error' : ''}`}
-            style={{ whiteSpace: 'pre-wrap' }}  // preserve newlines for JSON/text
-          >
-            {msg.text}
-          </div>
-        ))}
+        {messages.map((msg) => {
+          // ✅ Special rendering for upload preview message with table
+          if (msg.kind === 'upload_preview') {
+            return (
+              <div
+                key={msg.id}
+                className={`message bot`}
+                style={{ whiteSpace: 'pre-wrap' }}
+              >
+                <div>
+                  <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
+                    File uploaded successfully: {msg.filename}
+                  </div>
+                  <div style={{ marginBottom: '0.5rem' }}>
+                    Dataset ID: {msg.dataset_id}
+                  </div>
+                  <div style={{ fontWeight: 600, marginTop: '0.75rem' }}>
+                    Top 5 rows:
+                  </div>
+                  <PreviewTable rows={msg.headRows} />
+                </div>
+              </div>
+            );
+          }
+
+          // Default rendering for regular messages
+          return (
+            <div
+              key={msg.id}
+              className={`message ${msg.sender} ${msg.isError ? 'error' : ''}`}
+              style={{ whiteSpace: 'pre-wrap' }}
+            >
+              {msg.text}
+            </div>
+          );
+        })}
 
         {isLoading && (
           <div className="typing-indicator">

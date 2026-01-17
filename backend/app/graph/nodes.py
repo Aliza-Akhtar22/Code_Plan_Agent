@@ -163,6 +163,7 @@ def _safe_exec_run(code: str, df: pd.DataFrame, config: Dict[str, Any]) -> Dict[
     """
     allowed_globals: Dict[str, Any] = {
         "__builtins__": {
+            "__import__": __import__,
             "Exception": Exception,
             "ValueError": ValueError,
             "TypeError": TypeError,
