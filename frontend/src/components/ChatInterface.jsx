@@ -48,6 +48,21 @@ const ChatInterface = () => {
     ]);
   };
 
+  // New: forecast message that renders summary + tables
+  const addBotForecastMessage = ({ assistantText, results, isError }) => {
+    setMessages(prev => [
+      ...prev,
+      {
+        id: Date.now() + Math.random(),
+        sender: 'bot',
+        isError: Boolean(isError),
+        kind: 'forecast',
+        assistantText: assistantText || '',
+        results: results || null,
+      }
+    ]);
+  };
+
   const addUserMessage = (text) => {
     setMessages(prev => [
       ...prev,
@@ -55,19 +70,21 @@ const ChatInterface = () => {
     ]);
   };
 
-  // Helper: render a JSON rows array as a table
-  const PreviewTable = ({ rows }) => {
-    if (!rows || rows.length === 0) {
-      return <div style={{ marginTop: '0.5rem' }}>No preview rows available.</div>;
-    }
+  // Generic table renderer for arrays of objects
+  const DataTable = ({ rows, title }) => {
+    if (!rows || !Array.isArray(rows) || rows.length === 0) return null;
 
-    // Build a stable column list across all rows
     const colSet = new Set();
     rows.forEach(r => Object.keys(r || {}).forEach(k => colSet.add(k)));
     const columns = Array.from(colSet);
 
     return (
       <div style={{ marginTop: '0.75rem', overflowX: 'auto' }}>
+        {title && (
+          <div style={{ fontWeight: 600, marginBottom: '0.5rem', color: 'rgba(255,255,255,0.95)' }}>
+            {title}
+          </div>
+        )}
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -101,7 +118,8 @@ const ChatInterface = () => {
                       borderBottom: '1px solid rgba(255,255,255,0.08)',
                       color: 'rgba(255,255,255,0.85)',
                       fontSize: '0.9rem',
-                      verticalAlign: 'top'
+                      verticalAlign: 'top',
+                      whiteSpace: 'nowrap'
                     }}
                   >
                     {r?.[c] === null || r?.[c] === undefined ? '' : String(r[c])}
@@ -111,6 +129,51 @@ const ChatInterface = () => {
             ))}
           </tbody>
         </table>
+      </div>
+    );
+  };
+
+  const ForecastSummary = ({ results }) => {
+    if (!results) return null;
+
+    const trainingRows = results.training_rows ?? results.trainingRows;
+    const inputRows = results.input_rows ?? results.inputRows;
+    const cfg = results.config_used || results.configUsed || null;
+
+    const items = [
+      trainingRows !== undefined ? { k: "Training rows", v: trainingRows } : null,
+      inputRows !== undefined ? { k: "Input rows", v: inputRows } : null,
+      cfg?.ds_col ? { k: "ds column", v: cfg.ds_col } : null,
+      cfg?.y_col ? { k: "y column", v: cfg.y_col } : null,
+      cfg?.freq ? { k: "Frequency", v: cfg.freq } : null,
+      cfg?.periods ? { k: "Forecast periods", v: cfg.periods } : null,
+      Array.isArray(cfg?.regressors) ? { k: "Regressors", v: cfg.regressors.length ? cfg.regressors.join(", ") : "None" } : null,
+    ].filter(Boolean);
+
+    if (items.length === 0) return null;
+
+    return (
+      <div
+        style={{
+          marginTop: '0.25rem',
+          padding: '0.75rem',
+          borderRadius: '12px',
+          background: 'rgba(0,0,0,0.15)',
+          border: '1px solid rgba(255,255,255,0.08)'
+        }}
+      >
+        <div style={{ fontWeight: 700, marginBottom: '0.5rem', color: 'rgba(255,255,255,0.95)' }}>
+          Forecast Summary
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', rowGap: '0.35rem', columnGap: '0.75rem' }}>
+          {items.map((it, idx) => (
+            <div key={idx} style={{ display: 'contents' }}>
+              <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: '0.9rem' }}>{it.k}</div>
+              <div style={{ color: 'rgba(255,255,255,0.92)', fontSize: '0.9rem', fontWeight: 600 }}>{it.v}</div>
+            </div>
+          ))}
+        </div>
       </div>
     );
   };
@@ -145,17 +208,13 @@ const ChatInterface = () => {
       setDatasetId(data.dataset_id);
       setFileName(data.filename || file.name);
 
-      // ✅ Use table-based preview message instead of JSON stringify
       addBotPreviewMessage({
         filename: data.filename || file.name,
         dataset_id: data.dataset_id,
         headRows: data.preview?.head || [],
       });
 
-      // Add a normal instruction message after the table preview
-      addBotMessage(
-        `Now type a message like "hi" to get the plan and proposed ds/y, then reply "confirm".`
-      );
+      addBotMessage(`Now type a message like "hi" to get the plan and proposed ds/y, then reply "confirm".`);
 
     } catch (err) {
       console.error(err);
@@ -164,7 +223,6 @@ const ChatInterface = () => {
       addBotMessage(`Upload error: ${msg}`, true);
     } finally {
       setIsLoading(false);
-      // Allow re-uploading the same file by resetting input value
       e.target.value = '';
     }
   };
@@ -206,26 +264,43 @@ const ChatInterface = () => {
         throw new Error(data.error || 'Chat failed');
       }
 
-      // Prefer assistant_message, but ALWAYS append results when present
-      let botMessageText =
+      const assistantText =
         data.assistant_message ||
         data.reply ||
         data.message ||
         "";
 
-      if (data.results) {
-        botMessageText += `\n\nResults:\n${JSON.stringify(data.results, null, 2)}`;
-      }
+      // Prefer structured results from backend
+      const results = data.results || null;
+      const hasForecastTables =
+        results &&
+        (Array.isArray(results.forecast_head) || Array.isArray(results.forecast_tail));
 
-      if (data.error) {
-        botMessageText += `\n\nError:\n${data.error}`;
-      }
+      // If this response contains forecast results, render a forecast card (summary + tables)
+      if (hasForecastTables) {
+        addBotForecastMessage({
+          assistantText,
+          results,
+          isError: Boolean(data.error),
+        });
+      } else {
+        // Default text message (but still append results if present)
+        let botMessageText = assistantText;
 
-      if (!botMessageText.trim()) {
-        botMessageText = JSON.stringify(data, null, 2);
-      }
+        if (results) {
+          botMessageText += `\n\nResults:\n${JSON.stringify(results, null, 2)}`;
+        }
 
-      addBotMessage(botMessageText, Boolean(data.error));
+        if (data.error) {
+          botMessageText += `\n\nError:\n${data.error}`;
+        }
+
+        if (!botMessageText.trim()) {
+          botMessageText = JSON.stringify(data, null, 2);
+        }
+
+        addBotMessage(botMessageText, Boolean(data.error));
+      }
 
     } catch (error) {
       console.error('Error:', error);
@@ -262,31 +337,56 @@ const ChatInterface = () => {
 
       <div className="messages-area">
         {messages.map((msg) => {
-          // ✅ Special rendering for upload preview message with table
+          // Upload preview message with table
           if (msg.kind === 'upload_preview') {
             return (
               <div
                 key={msg.id}
-                className={`message bot`}
+                className="message bot"
                 style={{ whiteSpace: 'pre-wrap' }}
               >
-                <div>
-                  <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
-                    File uploaded successfully: {msg.filename}
-                  </div>
-                  <div style={{ marginBottom: '0.5rem' }}>
-                    Dataset ID: {msg.dataset_id}
-                  </div>
-                  <div style={{ fontWeight: 600, marginTop: '0.75rem' }}>
-                    Top 5 rows:
-                  </div>
-                  <PreviewTable rows={msg.headRows} />
+                <div style={{ fontWeight: 600, marginBottom: '0.5rem' }}>
+                  File uploaded successfully: {msg.filename}
                 </div>
+                <div style={{ marginBottom: '0.5rem' }}>
+                  Dataset ID: {msg.dataset_id}
+                </div>
+                <div style={{ fontWeight: 600, marginTop: '0.75rem' }}>
+                  Top 5 rows:
+                </div>
+                <DataTable rows={msg.headRows} />
               </div>
             );
           }
 
-          // Default rendering for regular messages
+          // Forecast results message with summary + head/tail tables
+          if (msg.kind === 'forecast') {
+            const results = msg.results || {};
+            const head = Array.isArray(results.forecast_head) ? results.forecast_head : [];
+            const tail = Array.isArray(results.forecast_tail) ? results.forecast_tail : [];
+
+            return (
+              <div
+                key={msg.id}
+                className={`message bot ${msg.isError ? 'error' : ''}`}
+                style={{ whiteSpace: 'pre-wrap' }}
+              >
+                {/* Keep the assistant narrative (short) */}
+                {msg.assistantText ? (
+                  <div style={{ marginBottom: '0.5rem' }}>
+                    {msg.assistantText}
+                  </div>
+                ) : null}
+
+                <ForecastSummary results={results} />
+
+                <DataTable rows={head} title="Forecast (Head)" />
+                <DataTable rows={tail} title="Forecast (Tail)" />
+              </div>
+            );
+          }
+
+          // Default message rendering
           return (
             <div
               key={msg.id}
