@@ -32,7 +32,7 @@ const ChatInterface = () => {
     ]);
   };
 
-  // New: bot message that can include a table preview
+  // Bot message that can include a table preview
   const addBotPreviewMessage = ({ filename, dataset_id, headRows }) => {
     setMessages(prev => [
       ...prev,
@@ -48,7 +48,7 @@ const ChatInterface = () => {
     ]);
   };
 
-  // New: forecast message that renders summary + tables
+  // Forecast message that renders summary + tables
   const addBotForecastMessage = ({ assistantText, results, isError }) => {
     setMessages(prev => [
       ...prev,
@@ -68,6 +68,43 @@ const ChatInterface = () => {
       ...prev,
       { id: Date.now() + Math.random(), text, sender: 'user' }
     ]);
+  };
+
+  // ✅ Strip the raw "Forecast (head/tail)" blocks from assistantText
+  const cleanAssistantText = (text) => {
+    if (!text) return '';
+    let t = String(text);
+
+    // Cut off everything from "Forecast (head)" onwards (covers your current backend format)
+    const cutMarkers = [
+      "Forecast (head):",
+      "Forecast(head):",
+      "Forecast head:",
+      "Forecast (tail):",
+      "Forecast(tail):",
+      "Forecast tail:",
+      "\nResults:",
+      "Results:"
+    ];
+
+    let idx = -1;
+    for (const m of cutMarkers) {
+      const i = t.indexOf(m);
+      if (i !== -1) {
+        idx = (idx === -1) ? i : Math.min(idx, i);
+      }
+    }
+
+    if (idx !== -1) {
+      t = t.slice(0, idx);
+    }
+
+    // Clean extra whitespace
+    t = t.trim();
+
+    // If it becomes empty, provide a minimal header
+    if (!t) return "Forecast completed.";
+    return t;
   };
 
   // Generic table renderer for arrays of objects
@@ -270,13 +307,11 @@ const ChatInterface = () => {
         data.message ||
         "";
 
-      // Prefer structured results from backend
       const results = data.results || null;
       const hasForecastTables =
         results &&
         (Array.isArray(results.forecast_head) || Array.isArray(results.forecast_tail));
 
-      // If this response contains forecast results, render a forecast card (summary + tables)
       if (hasForecastTables) {
         addBotForecastMessage({
           assistantText,
@@ -284,7 +319,6 @@ const ChatInterface = () => {
           isError: Boolean(data.error),
         });
       } else {
-        // Default text message (but still append results if present)
         let botMessageText = assistantText;
 
         if (results) {
@@ -337,7 +371,6 @@ const ChatInterface = () => {
 
       <div className="messages-area">
         {messages.map((msg) => {
-          // Upload preview message with table
           if (msg.kind === 'upload_preview') {
             return (
               <div
@@ -359,22 +392,23 @@ const ChatInterface = () => {
             );
           }
 
-          // Forecast results message with summary + head/tail tables
+          // ✅ Forecast: show ONLY clean header + summary + tables
           if (msg.kind === 'forecast') {
             const results = msg.results || {};
             const head = Array.isArray(results.forecast_head) ? results.forecast_head : [];
             const tail = Array.isArray(results.forecast_tail) ? results.forecast_tail : [];
 
+            const headerText = cleanAssistantText(msg.assistantText);
+
             return (
               <div
                 key={msg.id}
                 className={`message bot ${msg.isError ? 'error' : ''}`}
-                style={{ whiteSpace: 'pre-wrap' }}
               >
-                {/* Keep the assistant narrative (short) */}
-                {msg.assistantText ? (
-                  <div style={{ marginBottom: '0.5rem' }}>
-                    {msg.assistantText}
+                {/* Minimal header only (no raw head/tail list) */}
+                {headerText ? (
+                  <div style={{ marginBottom: '0.5rem', whiteSpace: 'pre-wrap' }}>
+                    {headerText}
                   </div>
                 ) : null}
 
@@ -386,7 +420,6 @@ const ChatInterface = () => {
             );
           }
 
-          // Default message rendering
           return (
             <div
               key={msg.id}
