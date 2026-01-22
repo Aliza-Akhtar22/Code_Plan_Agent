@@ -89,16 +89,24 @@ Requirements:
     - Create the column in future: future[reg] = last_known
 
 - Predict
+
+CRITICAL OUTPUT REQUIREMENTS (for UI friendliness):
+- Return ONLY FUTURE forecasts (do NOT return fitted historical rows).
+- Rename columns so they match the user's chosen ds/y names:
+  - ds -> ds_col value (e.g., "date")
+  - yhat -> f"{y_col}_forecast" (e.g., "p_forecast")
+  - yhat_lower -> f"{y_col}_lower"
+  - yhat_upper -> f"{y_col}_upper"
+- Round forecast numbers to 3 decimals for readability.
+
 - Return a dict with:
-  - "forecast_head": first 10 rows of ds,yhat,yhat_lower,yhat_upper as records
-  - "forecast_tail": last 10 rows as records
+  - "forecast": list of records for ONLY future rows with renamed columns
   - "config_used": config
   - "training_rows": number
   - "input_rows": number
 
 Be defensive and raise ValueError with clear messages if ds_col/y_col missing or training data ends up empty.
 """
-
 
 REPAIR_PROMPT = """You are debugging generated Prophet code.
 

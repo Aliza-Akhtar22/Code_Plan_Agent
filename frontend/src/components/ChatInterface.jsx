@@ -1,3 +1,4 @@
+// ChatInterface.jsx
 import { useState, useRef, useEffect } from 'react';
 import './ChatInterface.css';
 
@@ -48,7 +49,7 @@ const ChatInterface = () => {
     ]);
   };
 
-  // Forecast message that renders summary + tables
+  // Forecast message that renders summary + assistant text + results + (optional) tables
   const addBotForecastMessage = ({ assistantText, results, isError }) => {
     setMessages(prev => [
       ...prev,
@@ -70,12 +71,11 @@ const ChatInterface = () => {
     ]);
   };
 
-  // ✅ Strip the raw "Forecast (head/tail)" blocks from assistantText
+  // ✅ Strip the raw "Forecast (head/tail)" blocks from assistantText (used if you want a minimal header)
   const cleanAssistantText = (text) => {
     if (!text) return '';
     let t = String(text);
 
-    // Cut off everything from "Forecast (head)" onwards (covers your current backend format)
     const cutMarkers = [
       "Forecast (head):",
       "Forecast(head):",
@@ -99,10 +99,7 @@ const ChatInterface = () => {
       t = t.slice(0, idx);
     }
 
-    // Clean extra whitespace
     t = t.trim();
-
-    // If it becomes empty, provide a minimal header
     if (!t) return "Forecast completed.";
     return t;
   };
@@ -184,7 +181,9 @@ const ChatInterface = () => {
       cfg?.y_col ? { k: "y column", v: cfg.y_col } : null,
       cfg?.freq ? { k: "Frequency", v: cfg.freq } : null,
       cfg?.periods ? { k: "Forecast periods", v: cfg.periods } : null,
-      Array.isArray(cfg?.regressors) ? { k: "Regressors", v: cfg.regressors.length ? cfg.regressors.join(", ") : "None" } : null,
+      Array.isArray(cfg?.regressors)
+        ? { k: "Regressors", v: cfg.regressors.length ? cfg.regressors.join(", ") : "None" }
+        : null,
     ].filter(Boolean);
 
     if (items.length === 0) return null;
@@ -308,11 +307,25 @@ const ChatInterface = () => {
         "";
 
       const results = data.results || null;
-      const hasForecastTables =
-        results &&
-        (Array.isArray(results.forecast_head) || Array.isArray(results.forecast_tail));
 
-      if (hasForecastTables) {
+      // ✅ IMPORTANT FIX:
+      // Treat response as forecast if it has forecast-like payload,
+      // not only when forecast_head/forecast_tail exist.
+      const isForecastPayload = Boolean(
+        results && (
+          Array.isArray(results.forecast_head) ||
+          Array.isArray(results.forecast_tail) ||
+          Array.isArray(results.forecast) ||
+          results.config_used ||
+          results.configUsed ||
+          results.training_rows !== undefined ||
+          results.trainingRows !== undefined ||
+          results.input_rows !== undefined ||
+          results.inputRows !== undefined
+        )
+      );
+
+      if (isForecastPayload) {
         addBotForecastMessage({
           assistantText,
           results,
@@ -392,30 +405,56 @@ const ChatInterface = () => {
             );
           }
 
-          // ✅ Forecast: show ONLY clean header + summary + tables
+          // ✅ Forecast: show Forecast Summary FIRST, then assistant text as-is, then Results JSON,
+          // and finally any optional tables (head/tail or full forecast)
           if (msg.kind === 'forecast') {
             const results = msg.results || {};
             const head = Array.isArray(results.forecast_head) ? results.forecast_head : [];
             const tail = Array.isArray(results.forecast_tail) ? results.forecast_tail : [];
-
-            const headerText = cleanAssistantText(msg.assistantText);
+            const forecastFull = Array.isArray(results.forecast) ? results.forecast : [];
 
             return (
               <div
                 key={msg.id}
                 className={`message bot ${msg.isError ? 'error' : ''}`}
+                style={{ whiteSpace: 'pre-wrap' }}
               >
-                {/* Minimal header only (no raw head/tail list) */}
-                {headerText ? (
-                  <div style={{ marginBottom: '0.5rem', whiteSpace: 'pre-wrap' }}>
-                    {headerText}
+                {/* 1) Forecast summary (always if available) */}
+                <ForecastSummary results={results} />
+
+                {/* 2) Assistant message text as-is (so it matches your backend output) */}
+                {msg.assistantText ? (
+                  <div style={{ marginTop: '0.75rem', whiteSpace: 'pre-wrap' }}>
+                    {msg.assistantText}
                   </div>
                 ) : null}
 
-                <ForecastSummary results={results} />
+                {/* 3) Results JSON as-is (exactly like your pasted output) */}
+                {results ? (
+                  <pre
+                    style={{
+                      marginTop: '0.75rem',
+                      padding: '0.75rem',
+                      borderRadius: '12px',
+                      background: 'rgba(0,0,0,0.15)',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      overflowX: 'auto',
+                      color: 'rgba(255,255,255,0.92)',
+                      fontSize: '0.9rem'
+                    }}
+                  >
+{`Results:\n${JSON.stringify(results, null, 2)}`}
+                  </pre>
+                ) : null}
 
+                {/* 4) Optional: if you still have head/tail arrays */}
                 <DataTable rows={head} title="Forecast (Head)" />
                 <DataTable rows={tail} title="Forecast (Tail)" />
+
+                {/* 5) If backend only returns results.forecast, show it as a table too */}
+                {(!head.length && !tail.length && forecastFull.length) ? (
+                  <DataTable rows={forecastFull} title="Forecast" />
+                ) : null}
               </div>
             );
           }

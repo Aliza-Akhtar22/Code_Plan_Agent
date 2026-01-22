@@ -396,18 +396,29 @@ async def repair_codegen_node(state: AgentState) -> AgentState:
     state["attempt"] = attempt + 1
     return state
 
-
 async def results_node(state: AgentState) -> AgentState:
     if state.get("exec_output"):
-        out = state["exec_output"]
+        out = state["exec_output"] or {}
+        cfg = (out.get("config_used") or state.get("confirmed_config") or {}) if isinstance(out, dict) else {}
+        ds_col = (cfg.get("ds_col") or "ds")
+        y_col = (cfg.get("y_col") or "y")
+
+        forecast_rows = out.get("forecast") if isinstance(out, dict) else None
+        if not isinstance(forecast_rows, list):
+            forecast_rows = []
+
+        # Show a compact preview (not head/tail of full dataset) — only future rows.
+        preview_n = min(10, len(forecast_rows))
+        preview_rows = forecast_rows[:preview_n]
+
         state["assistant_message"] = (
             "Forecast completed.\n\n"
             f"Training rows used: {out.get('training_rows')}\n"
             f"Input rows: {out.get('input_rows')}\n\n"
-            "Forecast (head):\n"
-            f"{out.get('forecast_head')}\n\n"
-            "Forecast (tail):\n"
-            f"{out.get('forecast_tail')}\n"
+            f"Future forecast rows returned: {len(forecast_rows)}\n\n"
+            f"Forecast columns: {ds_col}, {y_col}_forecast, {y_col}_lower, {y_col}_upper\n\n"
+            "Forecast preview (first few future rows):\n"
+            f"{preview_rows}"
         )
         return state
 
