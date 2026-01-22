@@ -70,7 +70,8 @@ Requirements:
 - Parse ds to datetime with errors='coerce'
 - Convert y to numeric with errors='coerce'
 - Drop rows where ds or y is NaN
-- Sort by ds
+- Sort by ds 
+
 - If regressors present:
   - For each reg in regressors:
     - Ensure column exists

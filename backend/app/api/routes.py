@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import pandas as pd
 from fastapi import APIRouter, File, UploadFile
@@ -14,8 +14,13 @@ from app.graph.builder import build_graph
 from app.graph.state import AgentState
 
 router = APIRouter()
+
+# In-memory MVP stores
 store = DatasetStore()
 graph = build_graph()
+
+# Persist AgentState per dataset_id across chat turns (MVP memory store)
+STATE_STORE: Dict[str, AgentState] = {}
 
 
 class ChatRequest(BaseModel):
@@ -42,6 +47,9 @@ async def upload_file(file: UploadFile = File(...)) -> Dict[str, Any]:
 
     store.put(dataset_id, df)
 
+    # New dataset => new conversation state
+    STATE_STORE.pop(dataset_id, None)
+
     return {
         "ok": True,
         "dataset_id": dataset_id,
@@ -55,25 +63,47 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
     """
     Main chat endpoint. Uses LangGraph to progress through:
     preview -> plan -> infer columns -> confirm/modify -> codegen -> exec -> repair on error -> results
+
+    IMPORTANT (MVP):
+    - Persists AgentState per dataset_id so "confirm" does not re-infer a new config and override user changes.
     """
     df = store.get(req.dataset_id)
     if df is None:
         return {"ok": False, "error": "Invalid dataset_id. Upload first via /upload."}
 
-    # Initialize state each chat turn.
-    # MVP: stateless chat; we re-run inference each time and interpret user confirmation.
-    # Next step: persist state per dataset_id or session_id.
-    state: AgentState = AgentState(
-        dataset_id=req.dataset_id,
-        user_message=req.message,
-        df=df,
-        df_preview=preview_payload(df),
-        attempt=0,
-        max_attempts=2,
-        show_code=req.show_code,
-    )
+    prev_state = STATE_STORE.get(req.dataset_id)
+
+    if prev_state:
+        # Rehydrate existing state for this dataset_id
+        state: AgentState = dict(prev_state)  # shallow copy is fine
+        state["df"] = df
+        state["df_preview"] = preview_payload(df)  # refresh (optional but safe)
+        state["user_message"] = req.message
+        state["show_code"] = req.show_code
+
+        # Reset execution envelope for this turn
+        state["attempt"] = 0
+        state["exec_output"] = None
+        state["exec_error"] = None
+        state["traceback"] = None
+    else:
+        # First message for this dataset_id
+        state = AgentState(
+            dataset_id=req.dataset_id,
+            user_message=req.message,
+            df=df,
+            df_preview=preview_payload(df),
+            attempt=0,
+            max_attempts=2,
+            show_code=req.show_code,
+        )
 
     final_state = await graph.ainvoke(state)
+
+    # Persist for next turn (store without df to reduce memory usage)
+    to_store: AgentState = dict(final_state)
+    to_store.pop("df", None)
+    STATE_STORE[req.dataset_id] = to_store
 
     response: Dict[str, Any] = {
         "ok": True,

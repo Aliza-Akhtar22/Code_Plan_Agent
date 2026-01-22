@@ -16,10 +16,31 @@ from app.graph.nodes import (
 )
 
 
+# -----------------------------
+# Routing helpers
+# -----------------------------
+
+def _route_start(state: AgentState) -> str:
+    """
+    IMPORTANT: Prevent re-running column inference on every /chat call.
+
+    - If we already have a confirmed_config, we can proceed directly to codegen/exec.
+      (Typical when user sends another message after a successful confirm, or state is persisted.)
+    - If we already have a proposed_config, go directly to confirm to interpret user_message
+      ("confirm" or "modify ..."), without re-inferring columns.
+    - Otherwise this is the first turn for the dataset_id: run preview -> plan -> infer.
+    """
+    if state.get("confirmed_config"):
+        return "codegen"
+    if state.get("proposed_config"):
+        return "confirm"
+    return "preview"
+
+
 def _route_after_confirmation(state: AgentState) -> str:
     """
     If confirmed_config exists -> proceed to codegen.
-    Else we stay done for this turn (waiting for user confirm/modification).
+    Else we end this turn (waiting for user confirm/modification).
     """
     if state.get("confirmed_config"):
         return "codegen"
@@ -28,7 +49,6 @@ def _route_after_confirmation(state: AgentState) -> str:
 
 def _route_after_exec(state: AgentState) -> str:
     if state.get("exec_error"):
-        # allow repair loop if attempts remain
         attempt = int(state.get("attempt", 0) or 0)
         max_attempts = int(state.get("max_attempts", 2) or 2)
         if attempt < max_attempts:
@@ -40,6 +60,13 @@ def _route_after_exec(state: AgentState) -> str:
 def build_graph():
     g = StateGraph(AgentState)
 
+    # A no-op start node so we can route based on what's already in state.
+    # This is what stops the graph from re-running preview/plan/infer every time.
+    async def start_node(state: AgentState) -> AgentState:
+        return state
+
+    g.add_node("start", start_node)
+
     g.add_node("preview", supervisor_preview_node)
     g.add_node("plan", plan_node)
     g.add_node("infer_columns", column_inference_node)
@@ -50,23 +77,46 @@ def build_graph():
     g.add_node("repair", repair_codegen_node)
     g.add_node("results", results_node)
 
-    g.set_entry_point("preview")
+    # Entry point is now "start", not "preview"
+    g.set_entry_point("start")
 
+    # Route based on existing state
+    g.add_conditional_edges(
+        "start",
+        _route_start,
+        {
+            "preview": "preview",
+            "confirm": "confirm",
+            "codegen": "codegen",
+        },
+    )
+
+    # First-turn flow
     g.add_edge("preview", "plan")
     g.add_edge("plan", "infer_columns")
     g.add_edge("infer_columns", "confirm")
 
-    g.add_conditional_edges("confirm", _route_after_confirmation, {
-        "codegen": "codegen",
-        "end": END,
-    })
+    # Confirm flow
+    g.add_conditional_edges(
+        "confirm",
+        _route_after_confirmation,
+        {
+            "codegen": "codegen",
+            "end": END,
+        },
+    )
 
+    # Execute flow
     g.add_edge("codegen", "exec")
 
-    g.add_conditional_edges("exec", _route_after_exec, {
-        "traceback": "traceback",
-        "results": "results",
-    })
+    g.add_conditional_edges(
+        "exec",
+        _route_after_exec,
+        {
+            "traceback": "traceback",
+            "results": "results",
+        },
+    )
 
     g.add_edge("traceback", "repair")
     g.add_edge("repair", "exec")

@@ -27,6 +27,7 @@ class AgentState(TypedDict, total=False):
     plan_text: str
     proposed_config: ColumnConfig
     confirmed_config: ColumnConfig
+    pending_config: ColumnConfig  
 
     # Code execution
     generated_code: str

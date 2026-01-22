@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import traceback as tb
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pandas as pd
 import numpy as np
+import re
 from prophet import Prophet
 
 from app.core.profiling import preview_payload
@@ -32,6 +33,40 @@ COLUMNS:
 """
 
 
+def _normalize_config(raw: Dict[str, Any], fallback: Dict[str, Any]) -> ColumnConfig:
+    """
+    Normalize config strictly, using fallback for missing fields.
+    Ensures stable types (regressors=list[str], periods=int, freq=str).
+    """
+    regressors = raw.get("regressors", fallback.get("regressors", []))
+    if regressors is None:
+        regressors = []
+    if not isinstance(regressors, list):
+        regressors = [regressors]
+    regressors = [str(r).strip() for r in regressors if str(r).strip()]
+
+    freq = (raw.get("freq", fallback.get("freq", "D")) or "D").strip()
+    if freq not in ("D", "W", "M"):
+        freq = "D"
+
+    periods_val = raw.get("periods", fallback.get("periods", 30))
+    try:
+        periods = int(periods_val or 30)
+    except Exception:
+        periods = 30
+    if periods <= 0:
+        periods = 30
+
+    return {
+        "model": "prophet",
+        "ds_col": (raw.get("ds_col", fallback.get("ds_col", "")) or "").strip(),
+        "y_col": (raw.get("y_col", fallback.get("y_col", "")) or "").strip(),
+        "regressors": regressors,
+        "freq": freq,
+        "periods": periods,
+    }
+
+
 async def supervisor_preview_node(state: AgentState) -> AgentState:
     # Ensure preview exists (in case you call graph differently later)
     if "df_preview" not in state:
@@ -43,8 +78,6 @@ async def plan_node(state: AgentState) -> AgentState:
     user = _format_preview_for_llm(state)
     plan_text = await chat_text(SUPERVISOR_PLAN_PROMPT, user)
     state["plan_text"] = plan_text
-
-    # This message is early-stage; we also propose columns next.
     state["assistant_message"] = plan_text
     return state
 
@@ -53,17 +86,10 @@ async def column_inference_node(state: AgentState) -> AgentState:
     user = _format_preview_for_llm(state)
     j = await chat_json(COLUMN_INFERENCE_PROMPT, user)
 
-    proposed: ColumnConfig = {
-        "model": "prophet",
-        "ds_col": j.get("ds_col", "") or "",
-        "y_col": j.get("y_col", "") or "",
-        "regressors": j.get("regressors", []) or [],
-        "freq": j.get("freq", "D") or "D",
-        "periods": int(j.get("periods", 30) or 30),
-    }
+    proposed: ColumnConfig = _normalize_config(j or {}, {})
     state["proposed_config"] = proposed
 
-    rationale = j.get("rationale", "")
+    rationale = (j or {}).get("rationale", "")
     msg = (
         f"{state.get('assistant_message','')}\n\n"
         f"Proposed configuration:\n"
@@ -77,40 +103,115 @@ async def column_inference_node(state: AgentState) -> AgentState:
     if rationale:
         msg += f"\nRationale: {rationale}\n"
 
-    msg += "\nReply with 'confirm' to proceed, or tell me changes in natural language (e.g., 'use Date as ds, Sales as y, add Price regressor, forecast 60 days')."
+    msg += (
+        "\nReply with 'confirm' to proceed, or tell me changes in natural language "
+        "(e.g., 'use Date as ds, Sales as y, add Price regressor, forecast 60 days')."
+    )
 
     state["assistant_message"] = msg
     return state
 
-
 async def user_confirmation_node(state: AgentState) -> AgentState:
     proposed = state.get("proposed_config") or {}
-    user_msg = state.get("user_message", "").strip()
+    user_msg = (state.get("user_message") or "").strip()
+    msg_norm = user_msg.lower().strip()
 
-    # If user hasn't provided any message (unlikely), ask
     if not user_msg:
         state["assistant_message"] = "Please confirm the proposed ds/y/regressors, or specify changes."
         return state
 
-    # Interpret confirmation/modification
+    yes_tokens = {"yes", "y", "sure", "yeah", "yep"}
+    no_tokens = {"no", "n", "nope"}
+    confirm_tokens = {"confirm", "confirmed", "go ahead", "proceed"}
+
+    # ---------------------------------------------------------
+    # 1) If we have pending_config from a clarifying question:
+    #    - yes/no acts on it
+    #    - ANY OTHER message is treated as a NEW instruction
+    #      (do NOT block the user behind yes/no)
+    # ---------------------------------------------------------
+    pending = state.get("pending_config")
+    if pending:
+        if msg_norm in yes_tokens:
+            updated = _normalize_config(pending, proposed)
+            state["proposed_config"] = updated
+            state["confirmed_config"] = updated
+            state.pop("pending_config", None)
+
+            state["assistant_message"] = (
+                "Confirmed configuration:\n"
+                f"- model: Prophet\n"
+                f"- ds: {updated['ds_col']}\n"
+                f"- y: {updated['y_col']}\n"
+                f"- regressors: {updated['regressors']}\n"
+                f"- freq: {updated['freq']}\n"
+                f"- periods: {updated['periods']}\n\n"
+                "Generating code and running the forecast now."
+            )
+            return state
+
+        if msg_norm in no_tokens:
+            state.pop("pending_config", None)
+            state["assistant_message"] = (
+                "Okay — I won’t apply that pending change. "
+                "Please specify the exact update you want (e.g., 'forecast 2 days') or reply 'confirm'."
+            )
+            return state
+
+        # IMPORTANT: user gave a new instruction; drop pending and continue processing normally
+        state.pop("pending_config", None)
+
+    # ---------------------------------------------------------
+    # 2) Heuristic: detect forecast horizon like "forecast next 2 days"
+    #    This avoids LLM ambiguity and ensures plan updates immediately.
+    # ---------------------------------------------------------
+    m = re.search(r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*(day|days|d)\b", msg_norm)
+    if m:
+        periods = int(m.group(1))
+        updated = _normalize_config({"periods": periods}, proposed)
+        state["proposed_config"] = updated
+
+        state["assistant_message"] = (
+            "Updated proposed configuration:\n"
+            f"- model: Prophet\n"
+            f"- ds: {updated['ds_col']}\n"
+            f"- y: {updated['y_col']}\n"
+            f"- regressors: {updated['regressors']}\n"
+            f"- freq: {updated['freq']}\n"
+            f"- periods: {updated['periods']}\n\n"
+            "Reply with 'confirm' to proceed, or specify further changes."
+        )
+        return state
+
+    # ---------------------------------------------------------
+    # 3) Direct confirm (no pending_config)
+    # ---------------------------------------------------------
+    if msg_norm in confirm_tokens:
+        confirmed = _normalize_config(proposed, proposed)
+        state["confirmed_config"] = confirmed
+        state["assistant_message"] = (
+            "Confirmed configuration:\n"
+            f"- model: Prophet\n"
+            f"- ds: {confirmed['ds_col']}\n"
+            f"- y: {confirmed['y_col']}\n"
+            f"- regressors: {confirmed['regressors']}\n"
+            f"- freq: {confirmed['freq']}\n"
+            f"- periods: {confirmed['periods']}\n\n"
+            "Generating code and running the forecast now."
+        )
+        return state
+
+    # ---------------------------------------------------------
+    # 4) Otherwise, interpret via LLM (modify / ask_clarifying)
+    # ---------------------------------------------------------
     user = f"""proposed_config = {proposed}\n\nuser_message = {user_msg}"""
     j = await chat_json(CONFIRMATION_INTERPRETER_PROMPT, user)
 
     action = (j.get("action") or "").lower().strip()
-    config = j.get("config") or proposed
-    msg_to_user = j.get("message_to_user") or ""
-
-    # Normalize config
-    confirmed: ColumnConfig = {
-        "model": "prophet",
-        "ds_col": config.get("ds_col", proposed.get("ds_col", "")) or "",
-        "y_col": config.get("y_col", proposed.get("y_col", "")) or "",
-        "regressors": config.get("regressors", proposed.get("regressors", [])) or [],
-        "freq": config.get("freq", proposed.get("freq", "D")) or "D",
-        "periods": int(config.get("periods", proposed.get("periods", 30)) or 30),
-    }
+    msg_to_user = (j.get("message_to_user") or "").strip()
 
     if action == "confirm":
+        confirmed = _normalize_config(proposed, proposed)
         state["confirmed_config"] = confirmed
         state["assistant_message"] = (
             "Confirmed configuration:\n"
@@ -125,34 +226,41 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
         return state
 
     if action == "modify":
-        state["proposed_config"] = confirmed
+        raw_cfg = j.get("config") or {}
+        updated = _normalize_config(raw_cfg, proposed)
+        state["proposed_config"] = updated
         state["assistant_message"] = (
             (msg_to_user + "\n\n" if msg_to_user else "")
             + "Updated proposed configuration:\n"
             f"- model: Prophet\n"
-            f"- ds: {confirmed['ds_col']}\n"
-            f"- y: {confirmed['y_col']}\n"
-            f"- regressors: {confirmed['regressors']}\n"
-            f"- freq: {confirmed['freq']}\n"
-            f"- periods: {confirmed['periods']}\n\n"
+            f"- ds: {updated['ds_col']}\n"
+            f"- y: {updated['y_col']}\n"
+            f"- regressors: {updated['regressors']}\n"
+            f"- freq: {updated['freq']}\n"
+            f"- periods: {updated['periods']}\n\n"
             "Reply with 'confirm' to proceed, or specify further changes."
         )
         return state
 
-    # ask_clarifying or fallback
-    state["assistant_message"] = msg_to_user or "I’m not sure if you are confirming or changing the config. Please reply 'confirm' or specify ds/y/regressors."
-    return state
+    if action == "ask_clarifying":
+        raw_cfg = j.get("config") or {}
+        pending_cfg = _normalize_config(raw_cfg, proposed)
+        state["pending_config"] = pending_cfg
+        state["assistant_message"] = msg_to_user or "Just to confirm: reply 'yes' or 'no'."
+        return state
 
+    state["assistant_message"] = msg_to_user or "Please reply 'confirm' or specify the change explicitly."
+    return state
 
 async def codegen_node(state: AgentState) -> AgentState:
     config = state.get("confirmed_config")
     if not config:
-        # Not confirmed yet: do not generate code
         return state
 
     user = f"confirmed_config = {config}"
     code = await chat_text(CODEGEN_PROMPT, user)
     state["generated_code"] = code
+    print(code)
     return state
 
 
@@ -220,9 +328,7 @@ async def exec_node(state: AgentState) -> AgentState:
 
 
 async def traceback_node(state: AgentState) -> AgentState:
-    # Keep as separate node (you wanted it explicitly)
     if state.get("exec_error"):
-        # assistant_message can reflect an internal retry; we’ll keep it minimal
         state["assistant_message"] = (
             "I hit an execution error while running the generated Prophet code. "
             "I’m regenerating a corrected version and retrying."
@@ -271,5 +377,4 @@ async def results_node(state: AgentState) -> AgentState:
         )
         return state
 
-    # If not executed yet (e.g., waiting for confirm)
     return state
