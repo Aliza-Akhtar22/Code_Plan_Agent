@@ -70,17 +70,24 @@ Requirements:
 - Parse ds to datetime with errors='coerce'
 - Convert y to numeric with errors='coerce'
 - Drop rows where ds or y is NaN
-- Sort by ds 
+- Sort by ds
 
 - If regressors present:
   - For each reg in regressors:
-    - Ensure column exists
+    - Ensure column exists in df
+    - Carry reg into dfp (same name)
     - Convert to numeric if possible; if conversion fails, attempt simple category encoding using pandas factorize
     - Fill missing with median (numeric) or -1 (encoded)
     - model.add_regressor(reg)
+
 - Fit Prophet
 - Create future dataframe with make_future_dataframe(periods=periods, freq=freq)
-- If regressors present, extend regressors into future by forward fill from last known value
+
+- If regressors present, extend regressors into future:
+  - For each reg in regressors:
+    - last_known = dfp[reg].ffill().iloc[-1]
+    - Create the column in future: future[reg] = last_known
+
 - Predict
 - Return a dict with:
   - "forecast_head": first 10 rows of ds,yhat,yhat_lower,yhat_upper as records
@@ -91,6 +98,7 @@ Requirements:
 
 Be defensive and raise ValueError with clear messages if ds_col/y_col missing or training data ends up empty.
 """
+
 
 REPAIR_PROMPT = """You are debugging generated Prophet code.
 

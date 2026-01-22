@@ -105,11 +105,12 @@ async def column_inference_node(state: AgentState) -> AgentState:
 
     msg += (
         "\nReply with 'confirm' to proceed, or tell me changes in natural language "
-        "(e.g., 'use Date as ds, Sales as y, add Price regressor, forecast 60 days')."
+        "(e.g., 'use Date as ds, Sales as y, add Price regressor, forecast 2 months')."
     )
 
     state["assistant_message"] = msg
     return state
+
 
 async def user_confirmation_node(state: AgentState) -> AgentState:
     proposed = state.get("proposed_config") or {}
@@ -154,7 +155,7 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
             state.pop("pending_config", None)
             state["assistant_message"] = (
                 "Okay — I won’t apply that pending change. "
-                "Please specify the exact update you want (e.g., 'forecast 2 days') or reply 'confirm'."
+                "Please specify the exact update you want (e.g., 'forecast 2 months') or reply 'confirm'."
             )
             return state
 
@@ -162,13 +163,39 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
         state.pop("pending_config", None)
 
     # ---------------------------------------------------------
-    # 2) Heuristic: detect forecast horizon like "forecast next 2 days"
-    #    This avoids LLM ambiguity and ensures plan updates immediately.
+    # 2) Heuristic: detect forecast horizon like:
+    #    - "forecast next 2 months"
+    #    - "forecast for 8 weeks"
+    #    - "forecast 60 days"
+    #
+    #    We update BOTH freq and periods deterministically:
+    #      days  -> freq="D", periods=N
+    #      weeks -> freq="W", periods=N
+    #      months-> freq="M", periods=N
+    #      years -> freq="M", periods=N*12
     # ---------------------------------------------------------
-    m = re.search(r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*(day|days|d)\b", msg_norm)
+    m = re.search(
+        r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*(day|days|d|week|weeks|w|month|months|m|year|years|y)\b",
+        msg_norm,
+    )
     if m:
-        periods = int(m.group(1))
-        updated = _normalize_config({"periods": periods}, proposed)
+        n = int(m.group(1))
+        unit = m.group(2)
+
+        if unit in ("day", "days", "d"):
+            freq = "D"
+            periods = n
+        elif unit in ("week", "weeks", "w"):
+            freq = "W"
+            periods = n
+        elif unit in ("month", "months", "m"):
+            freq = "M"
+            periods = n
+        else:  # year/years/y
+            freq = "M"
+            periods = n * 12
+
+        updated = _normalize_config({"freq": freq, "periods": periods}, proposed)
         state["proposed_config"] = updated
 
         state["assistant_message"] = (
@@ -246,11 +273,26 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
         raw_cfg = j.get("config") or {}
         pending_cfg = _normalize_config(raw_cfg, proposed)
         state["pending_config"] = pending_cfg
-        state["assistant_message"] = msg_to_user or "Just to confirm: reply 'yes' or 'no'."
+
+        summary = (
+            "Pending update (reply 'yes' to apply, 'no' to ignore):\n"
+            f"- model: Prophet\n"
+            f"- ds: {pending_cfg.get('ds_col','')}\n"
+            f"- y: {pending_cfg.get('y_col','')}\n"
+            f"- regressors: {pending_cfg.get('regressors',[])}\n"
+            f"- freq: {pending_cfg.get('freq','D')}\n"
+            f"- periods: {pending_cfg.get('periods',30)}\n"
+        )
+
+        state["assistant_message"] = (
+            (msg_to_user.strip() + "\n\n" if msg_to_user else "")
+            + summary
+        )
         return state
 
     state["assistant_message"] = msg_to_user or "Please reply 'confirm' or specify the change explicitly."
     return state
+
 
 async def codegen_node(state: AgentState) -> AgentState:
     config = state.get("confirmed_config")
