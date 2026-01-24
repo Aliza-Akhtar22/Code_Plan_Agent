@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback as tb
 from typing import Any, Dict, List
+from app.graph.qa import answer_forecast_qa
 
 import numpy as np
 import pandas as pd
@@ -249,12 +250,17 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
 
     # 2) horizon heuristic
     m = re.search(
-        r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*(day|days|d|week|weeks|w|month|months|m|year|years|y)\b",
+        r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*"
+        r"(day|days|d|week|weeks|w|month|months|m|year|years|y|quarter|quarters|qtr|qtrs|q)\b",
         msg_norm,
     )
     if m:
         n = int(m.group(1))
         unit = m.group(2)
+
+        base_freq = (proposed.get("freq") or "D").strip()
+        if base_freq not in ("D", "W", "M"):
+            base_freq = "D"        
 
         if unit in ("day", "days", "d"):
             freq, periods = "D", n
@@ -262,8 +268,15 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
             freq, periods = "W", n
         elif unit in ("month", "months", "m"):
             freq, periods = "M", n
+        elif unit in ("year", "years", "y"):
+            freq, periods = "M", n * 12            
         else:
-            freq, periods = "M", n * 12
+            if base_freq == "D":
+                freq, periods = "D", n * 90
+            elif base_freq == "W":
+                freq, periods = "W", n * 13
+            else:
+                freq, periods = "M", n * 3
 
         updated = _normalize_config({"freq": freq, "periods": periods}, proposed)
         state["proposed_config"] = updated
@@ -476,5 +489,8 @@ async def results_node(state: AgentState) -> AgentState:
             "If you want, paste the columns you intend for ds/y/regressors and I will tighten the generation."
         )
         return state
-
+    
+async def qa_node(state: AgentState) -> AgentState:
+    answer = await answer_forecast_qa(state)
+    state["assistant_message"] = answer
     return state

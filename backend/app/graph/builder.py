@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langgraph.graph import StateGraph, END
+from app.graph.qa import is_probably_qa
 
 from app.graph.state import AgentState
 from app.graph.nodes import (
@@ -13,6 +14,7 @@ from app.graph.nodes import (
     traceback_node,
     repair_codegen_node,
     results_node,
+    qa_node,
 )
 
 
@@ -30,6 +32,8 @@ def _route_start(state: AgentState) -> str:
       ("confirm" or "modify ..."), without re-inferring columns.
     - Otherwise this is the first turn for the dataset_id: run preview -> plan -> infer.
     """
+    if is_probably_qa(state.get("user_message", "")):
+        return "qa"    
     if state.get("confirmed_config"):
         return "codegen"
     if state.get("proposed_config"):
@@ -76,6 +80,7 @@ def build_graph():
     g.add_node("traceback", traceback_node)
     g.add_node("repair", repair_codegen_node)
     g.add_node("results", results_node)
+    g.add_node("qa", qa_node)
 
     # Entry point is now "start", not "preview"
     g.set_entry_point("start")
@@ -88,6 +93,7 @@ def build_graph():
             "preview": "preview",
             "confirm": "confirm",
             "codegen": "codegen",
+            "qa": "qa",
         },
     )
 
@@ -121,5 +127,6 @@ def build_graph():
     g.add_edge("traceback", "repair")
     g.add_edge("repair", "exec")
     g.add_edge("results", END)
+    g.add_edge("qa", END)
 
     return g.compile()
