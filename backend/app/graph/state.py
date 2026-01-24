@@ -25,9 +25,12 @@ class AgentState(TypedDict, total=False):
 
     # Plan/config
     plan_text: str
+    plan_last_updated: str   # ISO timestamp (e.g., "2026-01-23T10:15:00Z")
+    plan_version: int        # increments whenever plan/config is updated
+
     proposed_config: ColumnConfig
     confirmed_config: ColumnConfig
-    pending_config: ColumnConfig  
+    pending_config: ColumnConfig
 
     # Code execution
     generated_code: str

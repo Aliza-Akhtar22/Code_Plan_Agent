@@ -3,21 +3,21 @@ from __future__ import annotations
 import traceback as tb
 from typing import Any, Dict, List
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import re
 from prophet import Prophet
 
 from app.core.profiling import preview_payload
-from app.graph.state import AgentState, ColumnConfig
+from app.graph.llm import chat_json, chat_text
 from app.graph.prompts import (
-    SUPERVISOR_PLAN_PROMPT,
+    CODEGEN_PROMPT,
     COLUMN_INFERENCE_PROMPT,
     CONFIRMATION_INTERPRETER_PROMPT,
-    CODEGEN_PROMPT,
     REPAIR_PROMPT,
+    SUPERVISOR_PLAN_PROMPT,
 )
-from app.graph.llm import chat_text, chat_json
+from app.graph.state import AgentState, ColumnConfig
 
 
 def _format_preview_for_llm(state: AgentState) -> str:
@@ -67,18 +67,141 @@ def _normalize_config(raw: Dict[str, Any], fallback: Dict[str, Any]) -> ColumnCo
     }
 
 
+def _render_config_block(cfg: Dict[str, Any], title: str = "Updated proposed configuration:") -> str:
+    regs = cfg.get("regressors", [])
+    return (
+        f"{title}\n"
+        f"- model: Prophet\n"
+        f"- ds: {cfg.get('ds_col','')}\n"
+        f"- y: {cfg.get('y_col','')}\n"
+        f"- regressors: {regs}\n"
+        f"- freq: {cfg.get('freq','D')}\n"
+        f"- periods: {cfg.get('periods',30)}\n"
+    )
+
+
+def _final_ui_message(cfg: Dict[str, Any]) -> str:
+    return (
+        f"{_render_config_block(cfg)}\n"
+        "Reply with 'confirm' to proceed, or specify further changes."
+    )
+
+
+def _colnames(state: AgentState) -> List[str]:
+    prev = state.get("df_preview") or {}
+    cols = prev.get("columns") or []
+    return [str(c) for c in cols]
+
+
+def _parse_regressor_override(user_msg: str, state: AgentState) -> Dict[str, Any] | None:
+    """
+    Explicit regressor instructions should REPLACE the regressor list.
+
+    Examples:
+    - "T is my regressor" -> ["T"]
+    - "regressor is T" -> ["T"]
+    - "regressors are T, rh" -> ["T","rh"]
+
+    IMPORTANT:
+    - Do NOT scan the entire message for column names (prevents picking up target like 'p').
+    - Exclude ds_col and y_col if they appear.
+    """
+    msg = (user_msg or "").strip()
+    if not msg:
+        return None
+
+    msg_l = msg.lower()
+
+    # Replacement triggers
+    replace_intent = any(
+        k in msg_l
+        for k in [
+            "regressors are",
+            "regressor is",
+            "is my regressor",
+            "as regressor",
+            "as regressors",
+        ]
+    )
+    if not replace_intent:
+        return None
+
+    cols = _colnames(state)
+    cols_l = {c.lower(): c for c in cols}
+
+    # Avoid using ds/y as regressors
+    proposed = state.get("proposed_config") or {}
+    ds_col = (proposed.get("ds_col") or "").strip()
+    y_col = (proposed.get("y_col") or "").strip()
+    blocked = {ds_col, y_col, ds_col.lower(), y_col.lower()}
+
+    # 1) Prefer parsing AFTER the regressor phrase
+    candidates_text = ""
+    for marker in ["regressors are", "regressor is", "is my regressor", "as regressors", "as regressor"]:
+        idx = msg_l.find(marker)
+        if idx != -1:
+            candidates_text = msg[idx + len(marker):].strip()
+            break
+
+    picked: List[str] = []
+
+    if candidates_text:
+        # Split candidates list
+        tokens = re.split(r"[,\n;/]+|\band\b", candidates_text, flags=re.IGNORECASE)
+        tokens = [t.strip(" .:-_()[]{}\"'") for t in tokens if t.strip()]
+        for t in tokens:
+            key = t.lower()
+            if key in cols_l:
+                c = cols_l[key]
+                if c not in blocked and c.lower() not in blocked:
+                    picked.append(c)
+
+    # 2) If still nothing, use tight regex near the regressor phrase (NOT whole-message scan)
+    if not picked:
+        m = re.search(r"\bregressor\s+is\s+([a-zA-Z0-9_.]+)\b", msg_l)
+        if not m:
+            m = re.search(r"\b([a-zA-Z0-9_.]+)\s+is\s+my\s+regressor\b", msg_l)
+        if m:
+            token = m.group(1).strip().lower()
+            if token in cols_l:
+                c = cols_l[token]
+                if c not in blocked and c.lower() not in blocked:
+                    picked.append(c)
+
+    # Deduplicate while preserving order
+    seen = set()
+    picked = [x for x in picked if not (x in seen or seen.add(x))]
+
+    return {"regressors": picked}
+
+
+def _parse_add_regressor(user_msg: str, state: AgentState) -> Dict[str, Any] | None:
+    msg_l = (user_msg or "").lower()
+    if "add" not in msg_l or "regressor" not in msg_l:
+        return None
+
+    cols = _colnames(state)
+    cols_l = {c.lower(): c for c in cols}
+
+    # pick first column mentioned after "add"
+    for c in cols:
+        if re.search(rf"\b{re.escape(c.lower())}\b", msg_l):
+            return {"add_regressor": cols_l.get(c.lower(), c)}
+    return None
+
+
 async def supervisor_preview_node(state: AgentState) -> AgentState:
-    # Ensure preview exists (in case you call graph differently later)
     if "df_preview" not in state:
         state["df_preview"] = preview_payload(state["df"])
     return state
 
 
 async def plan_node(state: AgentState) -> AgentState:
+    # Keep the supervisor plan stored (optional), but do not show it in UI
     user = _format_preview_for_llm(state)
     plan_text = await chat_text(SUPERVISOR_PLAN_PROMPT, user)
     state["plan_text"] = plan_text
-    state["assistant_message"] = plan_text
+    state["assistant_message"] = ""  # keep UI clean
     return state
 
 
@@ -89,26 +212,7 @@ async def column_inference_node(state: AgentState) -> AgentState:
     proposed: ColumnConfig = _normalize_config(j or {}, {})
     state["proposed_config"] = proposed
 
-    rationale = (j or {}).get("rationale", "")
-    msg = (
-        f"{state.get('assistant_message','')}\n\n"
-        f"Proposed configuration:\n"
-        f"- model: Prophet\n"
-        f"- ds: {proposed.get('ds_col','')}\n"
-        f"- y: {proposed.get('y_col','')}\n"
-        f"- regressors: {proposed.get('regressors',[])}\n"
-        f"- freq: {proposed.get('freq','D')}\n"
-        f"- periods: {proposed.get('periods',30)}\n"
-    )
-    if rationale:
-        msg += f"\nRationale: {rationale}\n"
-
-    msg += (
-        "\nReply with 'confirm' to proceed, or tell me changes in natural language "
-        "(e.g., 'use Date as ds, Sales as y, add Price regressor, forecast 2 months')."
-    )
-
-    state["assistant_message"] = msg
+    state["assistant_message"] = _final_ui_message(proposed)
     return state
 
 
@@ -125,12 +229,7 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
     no_tokens = {"no", "n", "nope"}
     confirm_tokens = {"confirm", "confirmed", "go ahead", "proceed"}
 
-    # ---------------------------------------------------------
-    # 1) If we have pending_config from a clarifying question:
-    #    - yes/no acts on it
-    #    - ANY OTHER message is treated as a NEW instruction
-    #      (do NOT block the user behind yes/no)
-    # ---------------------------------------------------------
+    # 1) pending yes/no
     pending = state.get("pending_config")
     if pending:
         if msg_norm in yes_tokens:
@@ -138,42 +237,17 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
             state["proposed_config"] = updated
             state["confirmed_config"] = updated
             state.pop("pending_config", None)
-
-            state["assistant_message"] = (
-                "Confirmed configuration:\n"
-                f"- model: Prophet\n"
-                f"- ds: {updated['ds_col']}\n"
-                f"- y: {updated['y_col']}\n"
-                f"- regressors: {updated['regressors']}\n"
-                f"- freq: {updated['freq']}\n"
-                f"- periods: {updated['periods']}\n\n"
-                "Generating code and running the forecast now."
-            )
+            state["assistant_message"] = "Generating code and running the forecast now."
             return state
 
         if msg_norm in no_tokens:
             state.pop("pending_config", None)
-            state["assistant_message"] = (
-                "Okay — I won’t apply that pending change. "
-                "Please specify the exact update you want (e.g., 'forecast 2 months') or reply 'confirm'."
-            )
+            state["assistant_message"] = "Okay — please specify the exact update you want or reply 'confirm'."
             return state
 
-        # IMPORTANT: user gave a new instruction; drop pending and continue processing normally
         state.pop("pending_config", None)
 
-    # ---------------------------------------------------------
-    # 2) Heuristic: detect forecast horizon like:
-    #    - "forecast next 2 months"
-    #    - "forecast for 8 weeks"
-    #    - "forecast 60 days"
-    #
-    #    We update BOTH freq and periods deterministically:
-    #      days  -> freq="D", periods=N
-    #      weeks -> freq="W", periods=N
-    #      months-> freq="M", periods=N
-    #      years -> freq="M", periods=N*12
-    # ---------------------------------------------------------
+    # 2) horizon heuristic
     m = re.search(
         r"(?:forecast\s*)?(?:for\s*)?(?:next\s*)?(\d+)\s*(day|days|d|week|weeks|w|month|months|m|year|years|y)\b",
         msg_norm,
@@ -183,54 +257,57 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
         unit = m.group(2)
 
         if unit in ("day", "days", "d"):
-            freq = "D"
-            periods = n
+            freq, periods = "D", n
         elif unit in ("week", "weeks", "w"):
-            freq = "W"
-            periods = n
+            freq, periods = "W", n
         elif unit in ("month", "months", "m"):
-            freq = "M"
-            periods = n
-        else:  # year/years/y
-            freq = "M"
-            periods = n * 12
+            freq, periods = "M", n
+        else:
+            freq, periods = "M", n * 12
 
         updated = _normalize_config({"freq": freq, "periods": periods}, proposed)
         state["proposed_config"] = updated
-
-        state["assistant_message"] = (
-            "Updated proposed configuration:\n"
-            f"- model: Prophet\n"
-            f"- ds: {updated['ds_col']}\n"
-            f"- y: {updated['y_col']}\n"
-            f"- regressors: {updated['regressors']}\n"
-            f"- freq: {updated['freq']}\n"
-            f"- periods: {updated['periods']}\n\n"
-            "Reply with 'confirm' to proceed, or specify further changes."
-        )
+        state["assistant_message"] = _final_ui_message(updated)
         return state
 
-    # ---------------------------------------------------------
-    # 3) Direct confirm (no pending_config)
-    # ---------------------------------------------------------
+    # 3) deterministic regressor override (REPLACE)
+    reg_override = _parse_regressor_override(user_msg, state)
+    if reg_override is not None:
+        # If user explicitly said regressor but we couldn't map, ask a clean clarifying question
+        if not reg_override.get("regressors"):
+            cols = _colnames(state)
+            state["assistant_message"] = (
+                "I couldn't identify that regressor column in your dataset. "
+                f"Available columns are: {cols}\n"
+                "Please type the exact column name for the regressor."
+            )
+            return state
+
+        updated = _normalize_config(reg_override, proposed)
+        state["proposed_config"] = updated
+        state["assistant_message"] = _final_ui_message(updated)
+        return state
+
+    # 4) deterministic add regressor (ADD)
+    add = _parse_add_regressor(user_msg, state)
+    if add:
+        updated_regs = list(proposed.get("regressors", []) or [])
+        r = add["add_regressor"]
+        if r not in updated_regs:
+            updated_regs.append(r)
+        updated = _normalize_config({"regressors": updated_regs}, proposed)
+        state["proposed_config"] = updated
+        state["assistant_message"] = _final_ui_message(updated)
+        return state
+
+    # 5) direct confirm
     if msg_norm in confirm_tokens:
         confirmed = _normalize_config(proposed, proposed)
         state["confirmed_config"] = confirmed
-        state["assistant_message"] = (
-            "Confirmed configuration:\n"
-            f"- model: Prophet\n"
-            f"- ds: {confirmed['ds_col']}\n"
-            f"- y: {confirmed['y_col']}\n"
-            f"- regressors: {confirmed['regressors']}\n"
-            f"- freq: {confirmed['freq']}\n"
-            f"- periods: {confirmed['periods']}\n\n"
-            "Generating code and running the forecast now."
-        )
+        state["assistant_message"] = "Generating code and running the forecast now."
         return state
 
-    # ---------------------------------------------------------
-    # 4) Otherwise, interpret via LLM (modify / ask_clarifying)
-    # ---------------------------------------------------------
+    # 6) interpret via LLM (modify / ask_clarifying)
     user = f"""proposed_config = {proposed}\n\nuser_message = {user_msg}"""
     j = await chat_json(CONFIRMATION_INTERPRETER_PROMPT, user)
 
@@ -240,54 +317,28 @@ async def user_confirmation_node(state: AgentState) -> AgentState:
     if action == "confirm":
         confirmed = _normalize_config(proposed, proposed)
         state["confirmed_config"] = confirmed
-        state["assistant_message"] = (
-            "Confirmed configuration:\n"
-            f"- model: Prophet\n"
-            f"- ds: {confirmed['ds_col']}\n"
-            f"- y: {confirmed['y_col']}\n"
-            f"- regressors: {confirmed['regressors']}\n"
-            f"- freq: {confirmed['freq']}\n"
-            f"- periods: {confirmed['periods']}\n\n"
-            "Generating code and running the forecast now."
-        )
+        state["assistant_message"] = "Generating code and running the forecast now."
         return state
 
     if action == "modify":
         raw_cfg = j.get("config") or {}
+
+        # IMPORTANT: If user text said "X is my regressor" but LLM returned many,
+        # override with deterministic parser (replace semantics).
+        reg_override2 = _parse_regressor_override(user_msg, state)
+        if reg_override2 is not None and reg_override2.get("regressors"):
+            raw_cfg["regressors"] = reg_override2["regressors"]
+
         updated = _normalize_config(raw_cfg, proposed)
         state["proposed_config"] = updated
-        state["assistant_message"] = (
-            (msg_to_user + "\n\n" if msg_to_user else "")
-            + "Updated proposed configuration:\n"
-            f"- model: Prophet\n"
-            f"- ds: {updated['ds_col']}\n"
-            f"- y: {updated['y_col']}\n"
-            f"- regressors: {updated['regressors']}\n"
-            f"- freq: {updated['freq']}\n"
-            f"- periods: {updated['periods']}\n\n"
-            "Reply with 'confirm' to proceed, or specify further changes."
-        )
+        state["assistant_message"] = _final_ui_message(updated)
         return state
 
     if action == "ask_clarifying":
         raw_cfg = j.get("config") or {}
         pending_cfg = _normalize_config(raw_cfg, proposed)
         state["pending_config"] = pending_cfg
-
-        summary = (
-            "Pending update (reply 'yes' to apply, 'no' to ignore):\n"
-            f"- model: Prophet\n"
-            f"- ds: {pending_cfg.get('ds_col','')}\n"
-            f"- y: {pending_cfg.get('y_col','')}\n"
-            f"- regressors: {pending_cfg.get('regressors',[])}\n"
-            f"- freq: {pending_cfg.get('freq','D')}\n"
-            f"- periods: {pending_cfg.get('periods',30)}\n"
-        )
-
-        state["assistant_message"] = (
-            (msg_to_user.strip() + "\n\n" if msg_to_user else "")
-            + summary
-        )
+        state["assistant_message"] = msg_to_user or "Could you clarify what change you want?"
         return state
 
     state["assistant_message"] = msg_to_user or "Please reply 'confirm' or specify the change explicitly."
@@ -307,10 +358,6 @@ async def codegen_node(state: AgentState) -> AgentState:
 
 
 def _safe_exec_run(code: str, df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Execute generated code in a restricted-ish environment.
-    Note: This is not a sandbox. For production, run in containerized sandbox.
-    """
     allowed_globals: Dict[str, Any] = {
         "__builtins__": {
             "__import__": __import__,
@@ -396,6 +443,7 @@ async def repair_codegen_node(state: AgentState) -> AgentState:
     state["attempt"] = attempt + 1
     return state
 
+
 async def results_node(state: AgentState) -> AgentState:
     if state.get("exec_output"):
         out = state["exec_output"] or {}
@@ -407,7 +455,6 @@ async def results_node(state: AgentState) -> AgentState:
         if not isinstance(forecast_rows, list):
             forecast_rows = []
 
-        # Show a compact preview (not head/tail of full dataset) — only future rows.
         preview_n = min(10, len(forecast_rows))
         preview_rows = forecast_rows[:preview_n]
 

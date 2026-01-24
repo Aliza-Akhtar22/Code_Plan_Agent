@@ -8,8 +8,8 @@ import pandas as pd
 from fastapi import APIRouter, File, UploadFile
 from pydantic import BaseModel, Field
 
-from app.core.storage import DatasetStore
 from app.core.profiling import preview_payload
+from app.core.storage import DatasetStore
 from app.graph.builder import build_graph
 from app.graph.state import AgentState
 
@@ -96,6 +96,10 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
             attempt=0,
             max_attempts=2,
             show_code=req.show_code,
+            # Plan metadata defaults (optional; nodes.py will set/update these)
+            plan_version=0,
+            plan_last_updated="",
+            plan_text="",
         )
 
     final_state = await graph.ainvoke(state)
@@ -109,6 +113,10 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
         "ok": True,
         "assistant_message": final_state.get("assistant_message") or "",
         "preview": final_state.get("df_preview"),
+        # NEW: return plan information explicitly (useful for a dedicated UI panel)
+        "plan_text": final_state.get("plan_text"),
+        "plan_version": final_state.get("plan_version", 0),
+        "plan_last_updated": final_state.get("plan_last_updated"),
         "proposed_config": final_state.get("proposed_config"),
         "confirmed_config": final_state.get("confirmed_config"),
         "results": final_state.get("exec_output"),
